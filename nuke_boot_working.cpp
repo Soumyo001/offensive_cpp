@@ -256,6 +256,7 @@ int main() {
     } else {
         std::cerr << "Warning: Cannot get partition layout, assuming GPT (Code: " << GetLastError() << ")\n";
         isGPT = true;
+        status[2].success = false;
     }
 
     // Nuke MBR/GPT
