@@ -169,6 +169,31 @@ bool StopService(const wchar_t* serviceName) {
     return false;
 }
 
+bool RandomizePartitionGUIDs(HANDLE hDisk, DRIVE_LAYOUT_INFORMATION_EX* layout, DWORD partitionCount, DWORD& errorCode) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 255);
+    BYTE* guidBuffer = new BYTE[16];
+    for (DWORD i = 0; i < partitionCount; ++i) {
+        for (int j = 0; j < 16; ++j) guidBuffer[j] = dis(gen);
+        memcpy(&layout->PartitionEntry[i].Gpt.PartitionId, guidBuffer, 16);
+    }
+    delete[] guidBuffer;
+    DWORD bytesReturned;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (DeviceIoControl(hDisk, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, layout, 
+                            sizeof(DRIVE_LAYOUT_INFORMATION_EX) + (partitionCount - 1) * sizeof(PARTITION_INFORMATION_EX), 
+                            nullptr, 0, &bytesReturned, nullptr)) {
+            errorCode = 0;
+            return true;
+        }
+        errorCode = GetLastError();
+        std::cerr << "Warning: Failed to randomize partition GUIDs (Code: " << errorCode << ", attempt " << attempt + 1 << ").\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    return false;
+}
+
 int main() {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 
@@ -218,7 +243,8 @@ int main() {
     };
     std::vector<NukeStatus> status = {
         {"MBR/GPT Primary", true},
-        {"GPT Backup", true}
+        {"GPT Backup", true},
+        {"Partition GUIDs", true}
     };
 
     bool isGPT = false;
@@ -228,9 +254,8 @@ int main() {
                         sizeof(layoutBuffer), &bytesReturned, nullptr)) {
         isGPT = (layout->PartitionStyle == PARTITION_STYLE_GPT);
     } else {
+        std::cerr << "Warning: Cannot get partition layout, assuming GPT (Code: " << GetLastError() << ")\n";
         isGPT = true;
-        status[2].success = false;
-        status[3].success = false;
     }
 
     // Nuke MBR/GPT
@@ -292,6 +317,25 @@ int main() {
             status[1].success = false;
         }
     }
+
+    if (isGPT && status[2].success) {
+        if (LockVolume(hDisk, errorCode)) {
+            if (!RandomizePartitionGUIDs(hDisk, layout, layout->PartitionCount, errorCode)) {
+                status[2].success = false;
+                status[2].errorCode = errorCode;
+                status[2].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
+            } else {
+                std::cout << "Partition GUIDs randomized.\n";
+            }
+            DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
+            UpdateDiskProperties(hDisk, errorCode);
+        } else {
+            status[2].success = false;
+            status[2].errorCode = errorCode;
+            status[2].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
+        }
+    }
+
 
     delete[] buffer;
     delete[] gptBuffer;
