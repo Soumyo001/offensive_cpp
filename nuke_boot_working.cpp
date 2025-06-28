@@ -24,7 +24,7 @@ bool OverwriteSector(HANDLE hDisk, LARGE_INTEGER offset, BYTE* buffer, DWORD siz
             return true;
         }
         errorCode = GetLastError();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     return false;
 }
@@ -37,7 +37,7 @@ bool LockVolume(HANDLE hVolume, DWORD& errorCode) {
             return true;
         }
         errorCode = GetLastError();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     return false;
 }
@@ -51,7 +51,7 @@ bool DismountVolume(HANDLE hVolume, DWORD& errorCode) {
             return true;
         }
         errorCode = GetLastError();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     return false;
 }
@@ -141,7 +141,7 @@ bool StopService(const wchar_t* serviceName) {
             std::wcout << serviceName << L" service stopped.\n";
             return true;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     STARTUPINFOW si = {sizeof(si)};
     PROCESS_INFORMATION pi = {0};
