@@ -323,17 +323,12 @@ int main() {
         if (LockVolume(hDisk, errorCode)) {
             if (!RandomizePartitionGUIDs(hDisk, layout, layout->PartitionCount, errorCode)) {
                 status[2].success = false;
-                status[2].errorCode = errorCode;
-                status[2].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
             } else {
                 std::cout << "Partition GUIDs randomized.\n";
             }
             DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
-            UpdateDiskProperties(hDisk, errorCode);
         } else {
             status[2].success = false;
-            status[2].errorCode = errorCode;
-            status[2].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
         }
     }
 
