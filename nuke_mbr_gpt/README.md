@@ -14,3 +14,6 @@
 
 **License**  
 By accessing and using this content, you acknowledge that the creator shall not be held liable for any damages, losses, or consequences arising from the use or misuse of the software. Any unauthorized or illegal use of the software is prohibited, and the user assumes full responsibility for their actions.
+
+**Contribute**  
+If you think anything could be improved or if you have suggestions, feel free to open a **pull request**. We value community contributions and will review any proposed changes carefully.
