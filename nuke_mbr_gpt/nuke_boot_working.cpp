@@ -58,34 +58,48 @@ bool DismountVolume(HANDLE hVolume, DWORD& errorCode) {
 
 bool ClearUEFIBootEntries(DWORD& errorCode) {
     for (int attempt = 0; attempt < 3; ++attempt) {
-        // Clear BootOrder
+        // Clear BootOrder first
         BYTE emptyBootOrder[1] = {0};
-        if (SetFirmwareEnvironmentVariableW(L"BootOrder", L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", 
-                                           emptyBootOrder, 0)) {
-            // Enumerate and delete Boot#### entries
-            std::cout<<"ENTERED UEFI BOOT ENTRIES\n";
-            wchar_t bootVarName[16];
+        if (SetFirmwareEnvironmentVariableW(L"BootOrder", L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", emptyBootOrder, 0)) {
+            // enumerate and delete Boot#### entries
             BYTE buffer[4096];
             DWORD bufferSize = sizeof(buffer);
             for (int i = 0; i < 0xFFFF; ++i) {
+                wchar_t bootVarName[16];
                 swprintf_s(bootVarName, L"Boot%04X", i);
-                if (GetFirmwareEnvironmentVariableW(bootVarName, L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", 
-                                                   buffer, bufferSize) == 0) {
-                    if (GetLastError() == ERROR_INVALID_PARAMETER) {
-                        continue;
+                // Attempt to get the firmware entry
+                if (GetFirmwareEnvironmentVariableW(bootVarName, L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", buffer, bufferSize) == 0) {
+                    DWORD err = GetLastError();
+                    
+                    if (err == ERROR_INVALID_FUNCTION) {
+                        std::cerr << "ERROR INVALID FUNCTION: " << err << "\n";
                     }
+                    else if (err == ERROR_ACCESS_DENIED) {
+                        std::cerr << "ERROR ACCESS DENIED while reading UEFI boot entry " << bootVarName << ": " << err << "\n";
+                        continue;  
+                    }
+                    else if (err == ERROR_INVALID_PARAMETER) {
+                        std::cerr<<"INVALID PARAMETER " << bootVarName << ": " << err << "\n";
+                        continue;  
+                    }
+
+                    std::cerr << "Error while reading UEFI boot entry " << bootVarName << ": " << err << std::endl;
+
                     break;
                 }
-                SetFirmwareEnvironmentVariableW(bootVarName, L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", 
-                                               nullptr, 0);
+
+                if (SetFirmwareEnvironmentVariableW(bootVarName, L"{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}", nullptr, 0)) {
+                    std::cout << "Deleted: " << bootVarName << std::endl;
+                } else {
+                    std::cerr << "Failed to delete: " << bootVarName << std::endl;
+                }
             }
             errorCode = 0;
-            std::cout<<"DONE UEFI BOOT ENTRIES\n";
             return true;
         }
         errorCode = GetLastError();
         std::cerr << "Warning: Failed to clear UEFI boot entries (Code: " << errorCode << ", attempt " << attempt + 1 << ").\n";
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Retry after 500 ms
     }
     return false;
 }
@@ -380,7 +394,8 @@ int main() {
         const GUID ESP_GUID = {0xC12A7328, 0xF81F, 0x11D2, {0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B}};
         LARGE_INTEGER espOffset = {0};
         bool espFound = false;
-
+    
+        // Check and find the ESP partition
         for (DWORD i = 0; i < layout->PartitionCount; ++i) {
             if (std::memcmp(&layout->PartitionEntry[i].Gpt.PartitionType, &ESP_GUID, sizeof(GUID)) == 0) {
                 espOffset.QuadPart = layout->PartitionEntry[i].StartingOffset.QuadPart;
@@ -388,10 +403,12 @@ int main() {
                 break;
             }
         }
-
-        if (espFound && espOffset.QuadPart >= 0 && espOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
+    
+        // If ESP found, validate its offset
+        if (espFound && espOffset.QuadPart > 0 && espOffset.QuadPart < diskGeometry.DiskSize.QuadPart) {
             if (LockVolume(hDisk, errorCode)) {
                 for (int pass = 0; pass < 4; ++pass) {
+                    // Set espBuffer to appropriate data based on the pass
                     if (pass == 0 || pass == 3) {
                         for (int j = 0; j < SECTOR_SIZE * ESP_SECTORS; ++j) espBuffer[j] = dis(gen);
                     } else if (pass == 1) {
@@ -399,10 +416,15 @@ int main() {
                     } else {
                         memset(espBuffer, 0xFF, SECTOR_SIZE * ESP_SECTORS);
                     }
+                
+                    // Overwrite ESP sectors
                     if (!OverwriteSector(hDisk, espOffset, espBuffer, SECTOR_SIZE * ESP_SECTORS, errorCode)) {
                         status[2].success = false;
+                        break;
                     }
                 }
+            
+                // Unlock the volume after overwriting
                 if (!DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr)) {
                     DWORD errorCode = GetLastError();
                     std::cerr << "FSCTL_UNLOCK_VOLUME failed for ESP. Error code: " << errorCode << std::endl;
@@ -414,9 +436,11 @@ int main() {
                 }
             } else {
                 status[2].success = false;
+                std::cerr << "Failed to lock the ESP volume. Error code: " << errorCode << std::endl;
             }
         } else {
             status[2].success = false;
+            std::cerr << "ESP partition not found or invalid offset." << std::endl;
         }
     }
 
