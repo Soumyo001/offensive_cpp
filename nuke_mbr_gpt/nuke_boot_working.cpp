@@ -259,8 +259,22 @@ int main() {
         status[2].success = false;
     }
 
-    // Nuke MBR/GPT
+    // randomize partition GUIDs
     DWORD errorCode;
+    // if (isGPT && status[2].success) {
+    //     if (LockVolume(hDisk, errorCode)) {
+    //         if (!RandomizePartitionGUIDs(hDisk, layout, layout->PartitionCount, errorCode)) {
+    //             status[2].success = false;
+    //         } else {
+    //             std::cout << "Partition GUIDs randomized.\n";
+    //         }
+    //         DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
+    //     } else {
+    //         status[2].success = false;
+    //     }
+    // }
+
+    // Nuke MBR/GPT
     if (LockVolume(hDisk, errorCode)) {
         for (int pass = 0; pass < 4; ++pass) {
             if (pass == 0 || pass == 3) {
@@ -316,19 +330,6 @@ int main() {
             }
         } else {
             status[1].success = false;
-        }
-    }
-
-    if (isGPT && status[2].success) {
-        if (LockVolume(hDisk, errorCode)) {
-            if (!RandomizePartitionGUIDs(hDisk, layout, layout->PartitionCount, errorCode)) {
-                status[2].success = false;
-            } else {
-                std::cout << "Partition GUIDs randomized.\n";
-            }
-            DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
-        } else {
-            status[2].success = false;
         }
     }
 
