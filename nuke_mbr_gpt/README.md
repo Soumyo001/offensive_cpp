@@ -1,6 +1,6 @@
 ## Attempt to nuke mbr/gpt, gpt backup, esp and UEFI boot entries
 
-### All Cplusplus files and their equivalent PEs
+### All Cpp files and their equivalent PEs
 
 |       file name          |        PE name         |
 |--------------------------|------------------------|
