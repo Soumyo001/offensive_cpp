@@ -13,7 +13,8 @@
 ---
 
 **License**  
-By accessing and using this content, you acknowledge that the creator shall not be held liable for any damages, losses, or consequences arising from the use or misuse of the software. Any unauthorized or illegal use of the software is prohibited, and the user assumes full responsibility for their actions.
+By accessing and using this content, you acknowledge that the creator shall not be held liable for any damages, losses, or consequences arising from the use or misuse of the software. Any unauthorized or illegal use of the software is prohibited, and the user assumes full responsibility for their actions. By using this software, you acknowledge that **you are solely responsible**
+for any outcomes, intended or unintended.
 
 **Contribute**  
-If you think anything could be improved or if you have suggestions, feel free to open a **pull request**. We value community contributions and will review any proposed changes carefully.
+If you think anything could be improved or if you have suggestions, feel free to open a **pull request**. Contributions are welcome provided they align with the educational and research purpose of this project. We value community contributions and will review any proposed changes carefully.
